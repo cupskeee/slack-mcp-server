@@ -11,14 +11,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gocarina/gocsv"
 	"github.com/google/uuid"
 	"github.com/korotovsky/slack-mcp-server/pkg/test/util"
+	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
 	"github.com/openai/openai-go/packages/param"
 	"github.com/openai/openai-go/responses"
+	"github.com/slack-go/slack"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
 func TestIntegrationConversations(t *testing.T) {
@@ -652,4 +656,275 @@ func TestUnitIsSlackUserIDPrefix(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestUnitMessageCSVIncludesThreadReplyFields(t *testing.T) {
+	messages := []Message{
+		{
+			MsgID:    "1772680334.954409",
+			UserID:   "U0123456789",
+			UserName: "john.doe",
+			Channel:  "C0AJMCRNH0U",
+			Text:     "thread parent",
+			Time:     "2026-03-03T12:00:00Z",
+			// A parent: replies exist, and LatestReply marks the newest one.
+			ReplyCount:  4,
+			LatestReply: "1772680900.111111",
+		},
+		{
+			MsgID:    "1772680500.222222",
+			UserID:   "U0123456789",
+			UserName: "john.doe",
+			Channel:  "C0AJMCRNH0U",
+			Text:     "standalone message",
+			Time:     "2026-03-03T12:05:00Z",
+			// Not a parent: both fields are zero and omitted from JSON.
+		},
+	}
+
+	csvBytes, err := gocsv.MarshalBytes(&messages)
+	require.NoError(t, err)
+	csvStr := string(csvBytes)
+
+	assert.Contains(t, csvStr, "ReplyCount")
+	assert.Contains(t, csvStr, "LatestReply")
+	assert.Contains(t, csvStr, "1772680900.111111")
+	assert.Contains(t, csvStr, "4")
+}
+
+func TestUnitIsValidSlackTimestamp(t *testing.T) {
+	tests := []struct {
+		name string
+		ts   string
+		want bool
+	}{
+		{"canonical last_read", "1234567890.123456", true},
+		{"bare unix seconds", "1700000000", true},
+		{"zero sentinel", "0000000000.000000", true},
+		{"empty", "", false},
+		{"non-numeric", "not-a-ts", false},
+		{"channel name", "#general", false},
+		{"trailing dot", "123.", false},
+		{"leading dot", ".123", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isValidSlackTimestamp(tt.ts); got != tt.want {
+				t.Errorf("isValidSlackTimestamp(%q) = %v, want %v", tt.ts, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestUnitParseParamsToolConversationsOldest covers the client-settable absolute
+// `oldest` param on conversations_history: it is used when provided, overrides the
+// window derived from a duration `limit`, and is validated as a Slack timestamp.
+func TestUnitParseParamsToolConversationsOldest(t *testing.T) {
+	ch := &ConversationsHandler{logger: zap.NewNop()}
+	ctx := context.Background()
+
+	newReq := func(args map[string]any) mcp.CallToolRequest {
+		req := mcp.CallToolRequest{}
+		req.Params.Arguments = args
+		return req
+	}
+
+	t.Run("explicit oldest is used", func(t *testing.T) {
+		params, err := ch.parseParamsToolConversations(ctx, newReq(map[string]any{
+			"channel_id": "C123",
+			"oldest":     "1700000000.000100",
+		}))
+		require.NoError(t, err)
+		assert.Equal(t, "1700000000.000100", params.oldest)
+	})
+
+	t.Run("explicit oldest overrides duration-derived oldest, latest preserved", func(t *testing.T) {
+		params, err := ch.parseParamsToolConversations(ctx, newReq(map[string]any{
+			"channel_id": "C123",
+			"limit":      "1d",
+			"oldest":     "1700000000.000100",
+		}))
+		require.NoError(t, err)
+		assert.Equal(t, "1700000000.000100", params.oldest)
+		assert.NotEmpty(t, params.latest, "duration-derived latest upper bound should survive the oldest override")
+	})
+
+	t.Run("numeric limit with oldest sets both, no latest bound", func(t *testing.T) {
+		params, err := ch.parseParamsToolConversations(ctx, newReq(map[string]any{
+			"channel_id": "C123",
+			"limit":      "50",
+			"oldest":     "1700000000.000100",
+		}))
+		require.NoError(t, err)
+		assert.Equal(t, "1700000000.000100", params.oldest)
+		assert.Equal(t, 50, params.limit)
+		assert.Empty(t, params.latest, "numeric limit should not set a latest upper bound")
+	})
+
+	t.Run("no oldest keeps duration-derived oldest", func(t *testing.T) {
+		params, err := ch.parseParamsToolConversations(ctx, newReq(map[string]any{
+			"channel_id": "C123",
+			"limit":      "1d",
+		}))
+		require.NoError(t, err)
+		assert.NotEmpty(t, params.oldest)
+		assert.True(t, strings.HasSuffix(params.oldest, ".000000"),
+			"duration-derived oldest should be a whole-second ts, got %q", params.oldest)
+	})
+
+	t.Run("invalid oldest returns error", func(t *testing.T) {
+		_, err := ch.parseParamsToolConversations(ctx, newReq(map[string]any{
+			"channel_id": "C123",
+			"oldest":     "not-a-ts",
+		}))
+		require.Error(t, err)
+	})
+
+	// Bounded pagination requires oldest to survive alongside a cursor: Slack's
+	// cursor encodes only a position, not the oldest floor, so a client must
+	// re-send oldest on each page or the lower bound is lost.
+	t.Run("oldest is kept alongside a cursor", func(t *testing.T) {
+		params, err := ch.parseParamsToolConversations(ctx, newReq(map[string]any{
+			"channel_id": "C123",
+			"cursor":     "bmV4dF90czoxNzgz",
+			"oldest":     "1700000000.000100",
+		}))
+		require.NoError(t, err)
+		assert.Equal(t, "1700000000.000100", params.oldest)
+		assert.Equal(t, "bmV4dF90czoxNzgz", params.cursor)
+	})
+}
+
+func TestUnitProcessText(t *testing.T) {
+	usersMap := map[string]slack.User{
+		"U12345678": {Profile: slack.UserProfile{DisplayName: "alice"}},
+		"W87654321": {Profile: slack.UserProfile{DisplayName: "bob"}},
+	}
+
+	tests := []struct {
+		name     string
+		input    string
+		userMap  map[string]slack.User
+		expected string
+	}{
+		{
+			name:     "known user mention resolved to name",
+			input:    "Hey <@U12345678> how are you?",
+			userMap:  usersMap,
+			expected: "Hey @alice how are you?",
+		},
+		{
+			name:     "unknown Slack bot mention",
+			input:    "Hey <@B12348765> how are you?",
+			userMap:  usersMap,
+			expected: "Hey <@B12348765> how are you?",
+		},
+		{
+			name:     "unknown user mention falls back to ID",
+			input:    "Hey <@UUNKNOWN99> sup",
+			userMap:  usersMap,
+			expected: "Hey @UUNKNOWN99 sup",
+		},
+		{
+			name:     "multiple known mentions",
+			input:    "<@U12345678> and <@W87654321> are here",
+			userMap:  usersMap,
+			expected: "@alice and @bob are here",
+		},
+		{
+			name:     "W-prefixed user ID resolved",
+			input:    "Ping <@W87654321>",
+			userMap:  usersMap,
+			expected: "Ping @bob",
+		},
+		{
+			name:     "mention alongside a link",
+			input:    "<@U12345678> check <https://example.com|this>",
+			userMap:  usersMap,
+			expected: "@alice check https://example.com - this",
+		},
+		{
+			name:     "empty users map falls back to ID",
+			input:    "Hi <@U12345678>",
+			userMap:  map[string]slack.User{},
+			expected: "Hi @U12345678",
+		},
+		{
+			name:     "normal text unchanged",
+			input:    "this machine is model-U12345678",
+			userMap:  usersMap,
+			expected: "this machine is model-U12345678",
+		},
+		{
+			name:     "invalid Slack user mention format treated as normal text",
+			input:    "I like <@  W87654321 > @U12345678 <U12345678> <@>",
+			userMap:  usersMap,
+			expected: "I like <@ W87654321 > @U12345678 <U12345678> <@>",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := processText(tt.input, tt.userMap)
+			if got != tt.expected {
+				t.Errorf("processText(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestUnitToChannelInfo(t *testing.T) {
+	t.Run("maps every field from a channel", func(t *testing.T) {
+		c := &slack.Channel{
+			GroupConversation: slack.GroupConversation{
+				Conversation: slack.Conversation{
+					ID:          "C0123456789",
+					LastRead:    "1783012455.512009",
+					UnreadCount: 3,
+					IsPrivate:   true,
+					IsExtShared: true,
+					NumMembers:  42,
+				},
+				Name: "general",
+			},
+			IsMember: true,
+		}
+
+		got := toChannelInfo(c)
+
+		assert.Equal(t, ChannelInfo{
+			ID:          "C0123456789",
+			Name:        "general",
+			LastRead:    "1783012455.512009",
+			UnreadCount: 3,
+			IsMember:    true,
+			IsPrivate:   true,
+			IsExtShared: true,
+			NumMembers:  42,
+		}, got)
+	})
+
+	t.Run("zero-value channel maps to zero-value info", func(t *testing.T) {
+		assert.Equal(t, ChannelInfo{}, toChannelInfo(&slack.Channel{}))
+	})
+
+	t.Run("DM carries id and unread_count but no name or membership", func(t *testing.T) {
+		c := &slack.Channel{
+			GroupConversation: slack.GroupConversation{
+				Conversation: slack.Conversation{
+					ID:          "D0123456789",
+					IsIM:        true,
+					LastRead:    "1783000000.000100",
+					UnreadCount: 5,
+				},
+			},
+		}
+
+		got := toChannelInfo(c)
+
+		assert.Equal(t, "D0123456789", got.ID)
+		assert.Empty(t, got.Name)
+		assert.Equal(t, 5, got.UnreadCount)
+		assert.False(t, got.IsMember)
+	})
 }

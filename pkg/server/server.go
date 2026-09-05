@@ -27,7 +27,9 @@ type MCPServer struct {
 const (
 	ToolConversationsHistory        = "conversations_history"
 	ToolConversationsReplies        = "conversations_replies"
+	ToolConversationsInfo           = "conversations_info"
 	ToolConversationsAddMessage     = "conversations_add_message"
+	ToolConversationsUpdateMessage  = "conversations_update_message"
 	ToolReactionsAdd                = "reactions_add"
 	ToolReactionsRemove             = "reactions_remove"
 	ToolAttachmentGetData           = "attachment_get_data"
@@ -47,12 +49,15 @@ const (
 	ToolSavedList                   = "saved_list"
 	ToolSavedUpdate                 = "saved_update"
 	ToolSavedClearCompleted         = "saved_clear_completed"
+	ToolFilesList                   = "files_list"
 )
 
 var ValidToolNames = []string{
 	ToolConversationsHistory,
 	ToolConversationsReplies,
+	ToolConversationsInfo,
 	ToolConversationsAddMessage,
+	ToolConversationsUpdateMessage,
 	ToolReactionsAdd,
 	ToolReactionsRemove,
 	ToolAttachmentGetData,
@@ -72,6 +77,7 @@ var ValidToolNames = []string{
 	ToolSavedList,
 	ToolSavedUpdate,
 	ToolSavedClearCompleted,
+	ToolFilesList,
 }
 
 func ValidateEnabledTools(tools []string) error {
@@ -146,6 +152,9 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 				mcp.DefaultString("1d"),
 				mcp.Description("Limit of messages to fetch in format of maximum ranges of time (e.g. 1d - 1 day, 1w - 1 week, 30d - 30 days, 90d - 90 days which is a default limit for free tier history) or number of messages (e.g. 50). Must be empty when 'cursor' is provided."),
 			),
+			mcp.WithString("oldest",
+				mcp.Description("Only include messages after this Slack timestamp (e.g. '1234567890.123456'), exclusive (a message whose ts equals 'oldest' is excluded). Useful to fetch only what is new since a known point, such as a channel's last_read marker. When more messages match than fit in one page, Slack returns the earliest ones first; keep 'oldest' set on each request and follow the returned 'cursor' to page through the rest (dropping 'oldest' while paging loses the lower bound)."),
+			),
 		), conversationsHandler.ConversationsHistoryHandler)
 	}
 
@@ -173,32 +182,53 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 				mcp.DefaultString("1d"),
 				mcp.Description("Limit of messages to fetch in format of maximum ranges of time (e.g. 1d - 1 day, 30d - 30 days, 90d - 90 days which is a default limit for free tier history) or number of messages (e.g. 50). Must be empty when 'cursor' is provided."),
 			),
+			mcp.WithString("oldest",
+				mcp.Description("Only include replies after this Slack timestamp (e.g. '1234567890.123456'), exclusive (a reply whose ts equals 'oldest' is excluded). The thread's parent message is always returned. When more replies match than fit in one page, Slack returns the earliest ones first; keep 'oldest' set on each request and follow the returned 'cursor' to page through the rest (dropping 'oldest' while paging loses the lower bound)."),
+			),
 		), conversationsHandler.ConversationsRepliesHandler)
 	}
 
+	if shouldAddTool(ToolConversationsInfo, enabledTools, "") {
+		s.AddTool(mcp.NewTool(ToolConversationsInfo,
+			mcp.WithDescription("Get metadata and your read state for a single channel or DM by channel_id. Returns a one-row CSV with columns ID, Name, LastRead, UnreadCount, IsMember, IsPrivate, IsExtShared, NumMembers. LastRead is the Slack timestamp of the last message you read: the read boundary you can use as a lower bound when fetching newer messages. Read state depends on the token: with OAuth user tokens (xoxp), UnreadCount is populated only for DMs; for channels, groups, and MPIMs it is 0, so rely on LastRead rather than UnreadCount. With bot tokens (xoxb) Slack populates neither, so LastRead and UnreadCount come back empty."),
+			mcp.WithTitleAnnotation("Get Conversation Info"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithString("channel_id",
+				mcp.Required(),
+				mcp.Description("ID of the channel in format Cxxxxxxxxxx or its name starting with #... or @... aka #general or @username_dm."),
+			),
+		), conversationsHandler.ConversationsInfoHandler)
+	}
+
 	if shouldAddTool(ToolConversationsAddMessage, enabledTools, "SLACK_MCP_ADD_MESSAGE_TOOL") {
-		s.AddTool(mcp.NewTool(ToolConversationsAddMessage,
-			mcp.WithDescription("Add a message to a public channel, private channel, or direct message (DM, or IM) conversation by channel_id and thread_ts."),
-			mcp.WithTitleAnnotation("Send Message"),
+		s.AddTool(newConversationsAddMessageTool(), conversationsHandler.ConversationsAddMessageHandler)
+	}
+
+	if shouldAddTool(ToolConversationsUpdateMessage, enabledTools, "SLACK_MCP_ADD_MESSAGE_TOOL") {
+		s.AddTool(mcp.NewTool(ToolConversationsUpdateMessage,
+			mcp.WithDescription("Edit an existing message you sent in a public channel, private channel, or direct message. Identify the message by channel_id and ts (original timestamp). Provide `text`, `blocks`, or both. IMPORTANT: with `content_type=text/markdown` (the default) the server converts `text` to Block Kit — write Markdown, NOT Slack mrkdwn, or content may be silently changed or deleted (same converter as conversations_add_message)."),
+			mcp.WithTitleAnnotation("Update Message"),
 			mcp.WithDestructiveHintAnnotation(true),
 			mcp.WithString("channel_id",
 				mcp.Required(),
 				mcp.Description("ID of the channel in format Cxxxxxxxxxx or its name starting with #... or @... aka #general or @username_dm."),
 			),
-			mcp.WithString("thread_ts",
-				mcp.Description("Unique identifier of either a thread's parent message or a message in the thread_ts must be the timestamp in format 1234567890.123456 of an existing message with 0 or more replies. Optional, if not provided the message will be added to the channel itself, otherwise it will be added to the thread."),
+			mcp.WithString("ts",
+				mcp.Required(),
+				mcp.Description("Timestamp of the message to edit, in format 1234567890.123456. This is the ts of the message returned when it was originally posted."),
 			),
 			mcp.WithString("text",
-				mcp.Description("Message text in specified content_type format. Example: 'Hello, world!' for text/plain or '# Hello, world!' for text/markdown."),
+				mcp.Description("New message text. For `content_type=text/markdown` (default), use Markdown, NOT Slack mrkdwn. Slack links such as `<url|label>` and `<url>` are silently deleted; use `[label](url)`. Mentions such as `<@U123>` are honored only in plain paragraphs — inside list items, headings, or block quotes they render as literal text. Use `**bold**`; `*text*` becomes italic. Reliable forms are plain paragraphs, `#` headings, inline code, fenced code blocks, and `> ` block quotes. Do not use tables, task lists, or `~~strikethrough~~`. For unformatted text, use `content_type=text/plain`."),
 			),
 			mcp.WithString("content_type",
 				mcp.DefaultString("text/markdown"),
-				mcp.Description("Content type of the message. Default is 'text/markdown'. Allowed values: 'text/markdown', 'text/plain'. Ignored when blocks is provided."),
+				mcp.Enum("text/markdown", "text/plain"),
+				mcp.Description("Controls `text` when `blocks` is omitted. `text/markdown` (default): convert the Markdown forms documented in `text` to Block Kit; do not use Slack mrkdwn. `text/plain`: skip Markdown conversion; use for logs, code, or literal formatting characters. When `blocks` is provided, `content_type` does not affect rendering."),
 			),
 			mcp.WithString("blocks",
-				mcp.Description("Raw Slack Block Kit JSON array for rich message formatting (rich_text lists, code blocks, etc.). When provided, this takes precedence over text/content_type for rendering. The text parameter becomes the notification fallback text."),
+				mcp.Description("Raw Slack Block Kit JSON array for rich message formatting. When provided, this takes precedence over text/content_type for rendering. The text parameter becomes the notification fallback text."),
 			),
-		), conversationsHandler.ConversationsAddMessageHandler)
+		), conversationsHandler.ConversationsUpdateMessageHandler)
 	}
 
 	if shouldAddTool(ToolReactionsAdd, enabledTools, "SLACK_MCP_REACTION_TOOL") {
@@ -313,6 +343,31 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 				mcp.Description("Maximum number of results to return (1-100). Default is 10."),
 			),
 		), conversationsHandler.UsersSearchHandler)
+	}
+
+	if shouldAddTool(ToolFilesList, enabledTools, "SLACK_MCP_FILES_LIST_TOOL") {
+		s.AddTool(mcp.NewTool(ToolFilesList,
+			mcp.WithDescription("List files shared in a Slack channel or workspace. Returns file metadata including ID, name, type, size, uploader, and permalink. Use the file_id from results with attachment_get_data to download file content. The last row cursor column is used for pagination."),
+			mcp.WithTitleAnnotation("List Files"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithString("channel_id",
+				mcp.Description("Filter files by channel ID (format Cxxxxxxxxxx) or channel name (e.g. #general). If omitted, lists files across all channels."),
+			),
+			mcp.WithString("user_id",
+				mcp.Description("Filter files uploaded by a specific user ID (format Uxxxxxxxxxx)."),
+			),
+			mcp.WithString("types",
+				mcp.DefaultString("all"),
+				mcp.Description("Filter by file type. Comma-separated values: all, spaces, snippets, images, gdocs, zips, pdfs. Default is all."),
+			),
+			mcp.WithString("limit",
+				mcp.DefaultString("50"),
+				mcp.Description("Maximum number of files to return (1-200). Default is 50."),
+			),
+			mcp.WithString("cursor",
+				mcp.Description("Cursor for pagination. Use the value from the last row cursor column returned by the previous request."),
+			),
+		), conversationsHandler.FilesListHandler)
 	}
 
 	// Register unreads tool - gets all unread messages across channels efficiently.
@@ -637,6 +692,45 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 		server: s,
 		logger: logger,
 	}
+}
+
+// newConversationsAddMessageTool builds the add-message tool schema.
+//
+// The descriptions are the only place a caller learns which Markdown dialect
+// this tool speaks, and getting it wrong fails silently: text/markdown goes
+// through slack-go-util (pinned in go.mod), which runs goldmark without the GFM
+// extensions, so Slack mrkdwn is either misrendered (*bold* becomes italic,
+// "• " lines collapse into one paragraph) or dropped outright (<url|label>
+// parses as a CommonMark autolink the converter does not emit). None of this
+// returns an error, so the caller sees a success response.
+//
+// Mentions are container-dependent: paragraphs become mrkdwn section blocks
+// that resolve <@U123>, while list items and quotes become rich_text and
+// headings become plain_text, neither of which resolves it.
+func newConversationsAddMessageTool() mcp.Tool {
+	return mcp.NewTool(ToolConversationsAddMessage,
+		mcp.WithDescription("Add a message to a public channel, private channel, or direct message (DM, or IM) conversation by channel_id and thread_ts. Provide `text`, `blocks`, or both. IMPORTANT: with `content_type=text/markdown` (the default) the server converts `text` to Block Kit — write Markdown, NOT Slack mrkdwn, or content may be silently changed or deleted."),
+		mcp.WithTitleAnnotation("Send Message"),
+		mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithString("channel_id",
+			mcp.Required(),
+			mcp.Description("ID of the channel in format Cxxxxxxxxxx or its name starting with #... or @... aka #general or @username_dm."),
+		),
+		mcp.WithString("thread_ts",
+			mcp.Description("Timestamp of the parent message when posting a thread reply, in format 1234567890.123456. Optional; omit to post to the channel or DM instead."),
+		),
+		mcp.WithString("text",
+			mcp.Description("Message text. For `content_type=text/markdown` (default), use Markdown, NOT Slack mrkdwn. Slack links such as `<url|label>` and `<url>` are silently deleted; use `[label](url)`. Mentions such as `<@U123>` are honored only in plain paragraphs — inside list items, headings, or block quotes they render as literal text. Single newlines within a paragraph are removed with no separator; start every bullet item with `- ` (never `• `), or use a blank line to start a new paragraph. Use `**bold**`; `*text*` becomes italic. Other reliable forms are plain paragraphs, `#` headings, inline code, fenced code blocks, and `> ` block quotes. Do not use tables, task lists such as `- [ ] todo`, or `~~strikethrough~~`. For unformatted text, use `content_type=text/plain`."),
+		),
+		mcp.WithString("content_type",
+			mcp.DefaultString("text/markdown"),
+			mcp.Enum("text/markdown", "text/plain"),
+			mcp.Description("Controls `text` when `blocks` is omitted. `text/markdown` (default): convert the Markdown forms documented in `text` to Block Kit; do not use Slack mrkdwn. `text/plain`: skip Markdown conversion and disable Slack mrkdwn; use for logs, code, or literal formatting characters. Line breaks are passed through in `text/plain`. When `blocks` is provided, `content_type` does not affect rendering."),
+		),
+		mcp.WithString("blocks",
+			mcp.Description("JSON-encoded string containing a Slack Block Kit blocks array. When provided, `blocks` controls rendering and `content_type` has no effect; `text` is not converted. Optional `text` is used as Slack's top-level fallback for notifications and accessibility. At least one of `text` or `blocks` is required."),
+		),
+	)
 }
 
 func (s *MCPServer) ServeSSE(addr string) *server.SSEServer {
